@@ -11,6 +11,7 @@
 */
 /* ESP32-S3 PoE temperature monitor using a DS18B20 1-Wire sensor. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -41,17 +42,28 @@ static const char *TAG = "ds18b20";
 #define DEVICE_HOSTNAME             "esp32-s3-eth"
 #define DS18B20_GPIO                CONFIG_DS18B20_GPIO
 #define DS18B20_TEMP_OFFSET_F_DEFAULT  -1.0f
-#define DS18B20_TEMP_OFFSET_STEP_F     0.1f
+#define DS18B20_TEMP_OFFSET_STEP_F     0.02f
 #define SAMPLE_INTERVAL_MS          1000        /*!< Time between sensor reads */
 #define SAMPLES_PER_AVERAGE         5           /*!< Number of reads averaged into each logged value (5 sec) */
 #define MAX_DS18B20_SENSORS         2
+#define RELAY1_GPIO                 GPIO_NUM_35
+#define THERMOSTAT_LOW_DEFAULT_F     75.5f       /*!< Relay 1 turns on at or below this temperature */
+#define THERMOSTAT_HIGH_DEFAULT_F    82.5f       /*!< Relay 1 turns off at or above this temperature */
+#define THERMOSTAT_TARGET_STEP_F     0.1f
 
 /* Shared temperature/offset state, protected by g_data_mutex since it is written
  * from the sensor task and read/written from HTTP server request handlers. */
 static SemaphoreHandle_t g_data_mutex;
 static float g_temp_f = 0.0f;
 static float g_temp2_f = 0.0f;
-static float g_offset_f = DS18B20_TEMP_OFFSET_F_DEFAULT;
+static float g_offset_f[MAX_DS18B20_SENSORS] = {
+    DS18B20_TEMP_OFFSET_F_DEFAULT,
+    DS18B20_TEMP_OFFSET_F_DEFAULT,
+};
+static bool g_relay1_on = false;
+static bool g_auto_enabled = true;
+static float g_target_low_f = THERMOSTAT_LOW_DEFAULT_F;
+static float g_target_high_f = THERMOSTAT_HIGH_DEFAULT_F;
 static SemaphoreHandle_t g_telnet_mutex;
 static int g_telnet_client = -1;
 static vprintf_like_t g_usb_vprintf;
@@ -205,6 +217,14 @@ static void ethernet_init(void)
     gpio_set_level(CONFIG_ETH_SPI_RST_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    /* Relay 1 output, driven by the web UI button */
+    gpio_config_t relay1_cfg = {
+        .pin_bit_mask = 1ULL << RELAY1_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_ERROR_CHECK(gpio_config(&relay1_cfg));
+    gpio_set_level(RELAY1_GPIO, 0);
+
     spi_bus_config_t buscfg = {
         .miso_io_num = CONFIG_ETH_SPI_MISO_GPIO,
         .mosi_io_num = CONFIG_ETH_SPI_MOSI_GPIO,
@@ -275,17 +295,51 @@ static esp_err_t favicon_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Heating-style thermostat: relay1 turns on at/below the low target and off at/above the high target.
+ * Skipped entirely when auto mode is disabled, leaving the relay1 button as the only control. */
+static void apply_thermostat_control(float current_temp_f)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    bool auto_enabled = g_auto_enabled;
+    float low = g_target_low_f;
+    float high = g_target_high_f;
+    bool relay_on = g_relay1_on;
+    if (auto_enabled) {
+        if (current_temp_f <= low) {
+            relay_on = true;
+        } else if (current_temp_f >= high) {
+            relay_on = false;
+        }
+        g_relay1_on = relay_on;
+    }
+    xSemaphoreGive(g_data_mutex);
+    if (auto_enabled) {
+        gpio_set_level(RELAY1_GPIO, relay_on ? 1 : 0);
+    }
+}
+
+static esp_err_t send_response(httpd_req_t *req, const char *response, int length)
+{
+    esp_err_t err = httpd_resp_send(req, response, length);
+    return err == ESP_ERR_HTTPD_RESP_SEND ? ESP_OK : err;
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     float temp_f, temp2_f, offset_f;
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
     temp_f = g_temp_f;
     temp2_f = g_temp2_f;
-    offset_f = g_offset_f;
+    offset_f = g_offset_f[0];
     xSemaphoreGive(g_data_mutex);
 
-    char resp[4096];
-    int len = snprintf(resp, sizeof(resp),
+    char *resp = malloc(4096);
+    if (resp == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int len = snprintf(resp, 4096,
         "<!DOCTYPE html><html><head>"
         "<title>Room Temperatures 1</title>"
         "<style>body{font-family:sans-serif;text-align:center;margin-top:40px}"
@@ -298,52 +352,182 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<h2>Sensor 1</h2><div class=\"temp\" id=\"temp\">%.2f&nbsp;&deg;F</div>"
         "<h2>Sensor 2</h2><div class=\"temp\" id=\"temp2\">%.2f&nbsp;&deg;F</div>"
         "<p>Calibration offset: <span id=\"offset\">%.2f</span>&nbsp;&deg;F</p>"
-        "<button class=\"btn\" onclick=\"adjust('/dec')\">-</button>"
-        "<button class=\"btn\" onclick=\"adjust('/inc')\">+</button>"
+        "<button class=\"btn\" onclick=\"adjust('/dec1')\">-</button>"
+        "<button class=\"btn\" onclick=\"adjust('/inc1')\">+</button>"
         "<script>"
-        "function update(d){document.getElementById('temp').innerHTML=d.temp_f.toFixed(2)+'&nbsp;&deg;F';"
-        "document.getElementById('temp2').innerHTML=d.temp2_f.toFixed(2)+'&nbsp;&deg;F';"
-        "document.getElementById('offset').textContent=d.offset_f.toFixed(2);}"
+        "function update(d){document.getElementById('offset').textContent=d.offset1_f.toFixed(2);"
+        "document.getElementById('temp').innerHTML=d.temp_f.toFixed(2)+'&nbsp;&deg;F';"
+        "document.getElementById('temp2').innerHTML=d.temp2_f.toFixed(2)+'&nbsp;&deg;F';}"
         "function poll(){fetch('/api/temp').then(r=>r.json()).then(update);}"
         "function adjust(url){fetch(url).then(r=>r.json()).then(update);}"
         "setInterval(poll,2000);"
         "</script>"
         "</body></html>",
         temp_f, temp2_f, offset_f);
+    if (len < 0 || len >= 4096) {
+        free(resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Page too large");
+        return ESP_FAIL;
+    }
+
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, resp, len);
+    esp_err_t err = send_response(req, resp, len);
+    free(resp);
+    return err;
+}
+
+static esp_err_t settings_get_handler(httpd_req_t *req)
+{
+    float offset1_f, offset2_f;
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    offset1_f = g_offset_f[0];
+    offset2_f = g_offset_f[1];
+    xSemaphoreGive(g_data_mutex);
+
+    char *resp = malloc(4096);
+    if (resp == NULL) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int len = snprintf(resp, 4096,
+        "<!DOCTYPE html><html><head>"
+        "<title>Settings</title>"
+        "<style>body{font-family:sans-serif;text-align:center;margin-top:40px}"
+        ".setting{margin:28px auto;max-width:420px}.offset{font-size:28px}"
+        ".btn{font-size:28px;padding:10px 10px;margin:10px;text-decoration:none;"
+        "border:1px solid #333;border-radius:8px;display:inline-block;color:#000;"
+        "background:none;cursor:pointer}</style>"
+        "</head><body>"
+        "<h1>Settings</h1>"
+        "<div class=\"setting\"><h2>Sensor 1 calibration offset</h2>"
+        "<div class=\"offset\"><span id=\"offset1\">%.2f</span>&nbsp;&deg;F</div>"
+        "<button class=\"btn\" onclick=\"adjust('/dec1')\">-</button>"
+        "<button class=\"btn\" onclick=\"adjust('/inc1')\">+</button></div>"
+        "<div class=\"setting\"><h2>Sensor 2 calibration offset</h2>"
+        "<div class=\"offset\"><span id=\"offset2\">%.2f</span>&nbsp;&deg;F</div>"
+        "<button class=\"btn\" onclick=\"adjust('/dec2')\">-</button>"
+        "<button class=\"btn\" onclick=\"adjust('/inc2')\">+</button></div>"
+        "<p><a class=\"btn\" href=\"/\">Back</a></p>"
+        "<script>"
+        "function update(d){document.getElementById('offset1').textContent=d.offset1_f.toFixed(2);"
+        "document.getElementById('offset2').textContent=d.offset2_f.toFixed(2);}"
+        "function adjust(url){fetch(url).then(r=>r.json()).then(update);}" 
+        "</script>"
+        "</body></html>", offset1_f, offset2_f);
+    if (len < 0 || len >= 4096) {
+        free(resp);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Page too large");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    esp_err_t err = send_response(req, resp, len);
+    free(resp);
+    return err;
 }
 
 static esp_err_t api_temp_get_handler(httpd_req_t *req)
 {
-    float temp_f, temp2_f, offset_f;
+    float temp_f, temp2_f, offset1_f, offset2_f, target_low_f, target_high_f;
+    bool relay1_on, auto_enabled;
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
     temp_f = g_temp_f;
     temp2_f = g_temp2_f;
-    offset_f = g_offset_f;
+    offset1_f = g_offset_f[0];
+    offset2_f = g_offset_f[1];
+    target_low_f = g_target_low_f;
+    target_high_f = g_target_high_f;
+    relay1_on = g_relay1_on;
+    auto_enabled = g_auto_enabled;
     xSemaphoreGive(g_data_mutex);
 
-    char resp[160];
-    int len = snprintf(resp, sizeof(resp), "{\"temp_f\":%.2f,\"temp2_f\":%.2f,\"offset_f\":%.2f}",
-                       temp_f, temp2_f, offset_f);
+    char resp[340];
+    int len = snprintf(resp, sizeof(resp),
+                       "{\"temp_f\":%.2f,\"temp2_f\":%.2f,\"offset1_f\":%.2f,\"offset2_f\":%.2f,"
+                       "\"target_low_f\":%.1f,\"target_high_f\":%.1f,\"relay1_on\":%s,\"auto_enabled\":%s}",
+                       temp_f, temp2_f, offset1_f, offset2_f, target_low_f, target_high_f,
+                       relay1_on ? "true" : "false", auto_enabled ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, resp, len);
+    return send_response(req, resp, len);
 }
 
-static esp_err_t offset_inc_handler(httpd_req_t *req)
+static esp_err_t relay1_toggle_handler(httpd_req_t *req)
 {
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-    g_offset_f += DS18B20_TEMP_OFFSET_STEP_F;
+    g_relay1_on = !g_relay1_on;
+    bool relay_on = g_relay1_on;
+    xSemaphoreGive(g_data_mutex);
+    gpio_set_level(RELAY1_GPIO, relay_on ? 1 : 0);
+    return api_temp_get_handler(req);
+}
+
+static esp_err_t auto_toggle_handler(httpd_req_t *req)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    g_auto_enabled = !g_auto_enabled;
     xSemaphoreGive(g_data_mutex);
     return api_temp_get_handler(req);
 }
 
-static esp_err_t offset_dec_handler(httpd_req_t *req)
+static esp_err_t target_low_inc_handler(httpd_req_t *req)
 {
     xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-    g_offset_f -= DS18B20_TEMP_OFFSET_STEP_F;
+    g_target_low_f += THERMOSTAT_TARGET_STEP_F;
     xSemaphoreGive(g_data_mutex);
     return api_temp_get_handler(req);
+}
+
+static esp_err_t target_low_dec_handler(httpd_req_t *req)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    g_target_low_f -= THERMOSTAT_TARGET_STEP_F;
+    xSemaphoreGive(g_data_mutex);
+    return api_temp_get_handler(req);
+}
+
+static esp_err_t target_high_inc_handler(httpd_req_t *req)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    g_target_high_f += THERMOSTAT_TARGET_STEP_F;
+    xSemaphoreGive(g_data_mutex);
+    return api_temp_get_handler(req);
+}
+
+static esp_err_t target_high_dec_handler(httpd_req_t *req)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    g_target_high_f -= THERMOSTAT_TARGET_STEP_F;
+    xSemaphoreGive(g_data_mutex);
+    return api_temp_get_handler(req);
+}
+
+static esp_err_t adjust_offset_handler(httpd_req_t *req, int sensor_index, float adjustment)
+{
+    xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+    g_offset_f[sensor_index] += adjustment;
+    xSemaphoreGive(g_data_mutex);
+    return api_temp_get_handler(req);
+}
+
+static esp_err_t offset_inc1_handler(httpd_req_t *req)
+{
+    return adjust_offset_handler(req, 0, DS18B20_TEMP_OFFSET_STEP_F);
+}
+
+static esp_err_t offset_dec1_handler(httpd_req_t *req)
+{
+    return adjust_offset_handler(req, 0, -DS18B20_TEMP_OFFSET_STEP_F);
+}
+
+static esp_err_t offset_inc2_handler(httpd_req_t *req)
+{
+    return adjust_offset_handler(req, 1, DS18B20_TEMP_OFFSET_STEP_F);
+}
+
+static esp_err_t offset_dec2_handler(httpd_req_t *req)
+{
+    return adjust_offset_handler(req, 1, -DS18B20_TEMP_OFFSET_STEP_F);
 }
 
 static esp_err_t ota_post_handler(httpd_req_t *req)
@@ -407,22 +591,41 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
 static void start_webserver(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
     /* Close the oldest idle connection instead of refusing new ones once max_open_sockets is hit */
     config.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     ESP_ERROR_CHECK(httpd_start(&server, &config));
 
     const httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
+    const httpd_uri_t settings_uri = { .uri = "/settings", .method = HTTP_GET, .handler = settings_get_handler };
     const httpd_uri_t favicon_uri = { .uri = "/favicon.ico", .method = HTTP_GET, .handler = favicon_get_handler };
     const httpd_uri_t api_temp_uri = { .uri = "/api/temp", .method = HTTP_GET, .handler = api_temp_get_handler };
-    const httpd_uri_t inc_uri = { .uri = "/inc", .method = HTTP_GET, .handler = offset_inc_handler };
-    const httpd_uri_t dec_uri = { .uri = "/dec", .method = HTTP_GET, .handler = offset_dec_handler };
+    const httpd_uri_t inc1_uri = { .uri = "/inc1", .method = HTTP_GET, .handler = offset_inc1_handler };
+    const httpd_uri_t dec1_uri = { .uri = "/dec1", .method = HTTP_GET, .handler = offset_dec1_handler };
+    const httpd_uri_t inc2_uri = { .uri = "/inc2", .method = HTTP_GET, .handler = offset_inc2_handler };
+    const httpd_uri_t dec2_uri = { .uri = "/dec2", .method = HTTP_GET, .handler = offset_dec2_handler };
+    const httpd_uri_t target_low_inc_uri = { .uri = "/target_low_inc", .method = HTTP_GET, .handler = target_low_inc_handler };
+    const httpd_uri_t target_low_dec_uri = { .uri = "/target_low_dec", .method = HTTP_GET, .handler = target_low_dec_handler };
+    const httpd_uri_t target_high_inc_uri = { .uri = "/target_high_inc", .method = HTTP_GET, .handler = target_high_inc_handler };
+    const httpd_uri_t target_high_dec_uri = { .uri = "/target_high_dec", .method = HTTP_GET, .handler = target_high_dec_handler };
+    const httpd_uri_t relay1_uri = { .uri = "/relay1", .method = HTTP_GET, .handler = relay1_toggle_handler };
+    const httpd_uri_t auto_toggle_uri = { .uri = "/auto_toggle", .method = HTTP_GET, .handler = auto_toggle_handler };
     const httpd_uri_t ota_uri = { .uri = "/ota", .method = HTTP_POST, .handler = ota_post_handler };
     httpd_register_uri_handler(server, &root_uri);
+    httpd_register_uri_handler(server, &settings_uri);
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &api_temp_uri);
-    httpd_register_uri_handler(server, &inc_uri);
-    httpd_register_uri_handler(server, &dec_uri);
+    httpd_register_uri_handler(server, &inc1_uri);
+    httpd_register_uri_handler(server, &dec1_uri);
+    httpd_register_uri_handler(server, &inc2_uri);
+    httpd_register_uri_handler(server, &dec2_uri);
+    httpd_register_uri_handler(server, &target_low_inc_uri);
+    httpd_register_uri_handler(server, &target_low_dec_uri);
+    httpd_register_uri_handler(server, &target_high_inc_uri);
+    httpd_register_uri_handler(server, &target_high_dec_uri);
+    httpd_register_uri_handler(server, &relay1_uri);
+    httpd_register_uri_handler(server, &auto_toggle_uri);
     httpd_register_uri_handler(server, &ota_uri);
 }
 
@@ -472,16 +675,18 @@ void app_main(void)
         ESP_ERROR_CHECK(ds18b20_trigger_temperature_conversion_for_all(bus));
         float temp_f[MAX_DS18B20_SENSORS];
 
-        xSemaphoreTake(g_data_mutex, portMAX_DELAY);
-        float offset_f = g_offset_f;
-        xSemaphoreGive(g_data_mutex);
-
         for (int sensor_index = 0; sensor_index < sensor_count; sensor_index++) {
             float temp_c;
+            float offset_f;
             ESP_ERROR_CHECK(ds18b20_get_temperature(sensors[sensor_index], &temp_c));
+            xSemaphoreTake(g_data_mutex, portMAX_DELAY);
+            offset_f = g_offset_f[sensor_index];
+            xSemaphoreGive(g_data_mutex);
             temp_f[sensor_index] = temp_c * 9.0f / 5.0f + 32.0f + offset_f;
             temp_sum_f[sensor_index] += temp_f[sensor_index];
         }
+
+        apply_thermostat_control(temp_f[0]);
 
         sample_count++;
 
